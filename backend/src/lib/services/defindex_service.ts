@@ -33,6 +33,9 @@ import {
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
+import { eq, sql } from "drizzle-orm";
+import { db } from "../db";
+import { savingsHistory, users } from "../db/schema";
 
 /** Configured DeFindex SDK instance plus the Soroban RPC client it talks to. */
 export interface DefindexClient {
@@ -1238,4 +1241,283 @@ export class DefindexService {
       );
     }
   }
+
+  /**
+   * Persists a confirmed savings transfer atomically.
+   *
+   * All database writes run inside a single `db.transaction()` block:
+   * 1. Lock the user's ledger row (`SELECT ... FOR UPDATE`) so concurrent
+   *    savings writes for the same user are serialized.
+   * 2. Conflict check — an existing `savings_history` row with the same
+   *    `transaction_hash` is returned idempotently; a hash owned by another
+   *    user aborts the transaction.
+   * 3. Insert the `savings_history` entry with status `completed`.
+   * 4. Update the cached `users.savings_balance` / `users.savings_status`.
+   *
+   * Throwing anywhere inside the callback rolls everything back, so the
+   * local database can never diverge from the Stellar blockchain with a
+   * partial write or a race-condition double-apply.
+   */
+  static async recordSuccessfulSavingsTransaction(
+    input: RecordSavingsTransactionInput,
+  ): Promise<RecordedSavingsTransaction> {
+    const amount = Number(input.amount);
+    const transactionHash = input.transactionHash?.trim();
+    const vaultContractId =
+      input.vaultContractId?.trim() || process.env.DEFINDEX_VAULT_CONTRACT_ID;
+    if (!input.userId) {
+      throw new DefindexServiceError("userId is required", "validation");
+    }
+    if (input.type !== "deposit" && input.type !== "withdrawal") {
+      throw new DefindexServiceError("Invalid savings transaction type", "validation");
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new DefindexServiceError(
+        "Savings amount must be greater than zero",
+        "validation",
+      );
+    }
+    if (!vaultContractId) {
+      throw new DefindexServiceError(
+        "Vault contract id is required to record a savings transaction",
+        "validation",
+      );
+    }
+    if (!transactionHash || !/^[a-fA-F0-9]{64}$/.test(transactionHash)) {
+      throw new DefindexServiceError(
+        "Valid 64-character blockchain transaction hash is required",
+        "validation",
+      );
+    }
+    const currency = input.currency?.trim().toUpperCase() || "USDC";
+
+    try {
+      return await db.transaction(async (tx) => {
+        // 1. Lock the user's ledger row.
+        const [lockedUser] = await tx
+          .select()
+          .from(users)
+          .where(eq(users.id, input.userId))
+          .for("update");
+        if (!lockedUser) {
+          throw new Error("User not found");
+        }
+
+        // 2. Conflict detection — idempotent replay.
+        const existing = await tx.query.savingsHistory.findFirst({
+          where: eq(savingsHistory.transactionHash, transactionHash),
+        });
+        if (existing) {
+          if (existing.userId !== input.userId) {
+            throw new Error("Transaction hash already claimed by another user");
+          }
+          return {
+            transaction: existing,
+            savingsBalance: lockedUser.savingsBalance,
+          };
+        }
+
+        // 3. Withdrawals must not overdraw the cached ledger balance.
+        if (
+          input.type === "withdrawal" &&
+          Number(lockedUser.savingsBalance || 0) < amount
+        ) {
+          throw new Error("Insufficient savings balance");
+        }
+
+        // 4. Insert the history entry.
+        const [inserted] = await tx
+          .insert(savingsHistory)
+          .values({
+            userId: input.userId,
+            vaultContractId,
+            type: input.type,
+            status: "completed",
+            amount,
+            currency,
+            transactionHash,
+            sharesToBurn: input.sharesToBurn ?? null,
+            sharePrice: input.sharePrice ?? null,
+            sharesBalance: input.sharesBalance ?? null,
+          })
+          .returning();
+        if (!inserted) {
+          throw new Error("Failed to insert savings history entry");
+        }
+
+        // 5. Update the cached savings balance atomically.
+        const [updatedUser] = await tx
+          .update(users)
+          .set({
+            savingsBalance:
+              input.type === "deposit"
+                ? sql`${users.savingsBalance} + ${amount}`
+                : sql`${users.savingsBalance} - ${amount}`,
+            savingsStatus: "active",
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, input.userId))
+          .returning({ savingsBalance: users.savingsBalance });
+        if (!updatedUser) {
+          throw new Error("Failed to update savings balance");
+        }
+
+        return {
+          transaction: inserted,
+          savingsBalance: updatedUser.savingsBalance,
+        };
+      });
+    } catch (error) {
+      if (error instanceof DefindexServiceError) {
+        throw error;
+      }
+      const err = error instanceof Error ? error : new Error(String(error));
+      throw new DefindexServiceError(
+        `Failed to record savings ${input.type} for user ${input.userId}: ${err.message}`,
+        "upstream",
+        err,
+      );
+    }
+  }
+
+  /** Convenience wrapper for recording a confirmed savings deposit. */
+  static async recordSavingsDeposit(
+    input: Omit<RecordSavingsTransactionInput, "type">,
+  ): Promise<RecordedSavingsTransaction> {
+    return DefindexService.recordSuccessfulSavingsTransaction({
+      ...input,
+      type: "deposit",
+    });
+  }
+
+  /** Convenience wrapper for recording a confirmed savings withdrawal. */
+  static async recordSavingsWithdrawal(
+    input: Omit<RecordSavingsTransactionInput, "type">,
+  ): Promise<RecordedSavingsTransaction> {
+    return DefindexService.recordSuccessfulSavingsTransaction({
+      ...input,
+      type: "withdrawal",
+    });
+  }
+
+  /**
+   * Records a failed savings transfer without mutating the cached balance.
+   * Still executed inside `db.transaction()` with the user row locked so the
+   * failure marker cannot interleave with a concurrent success; any error
+   * rolls the block back.
+   */
+  static async recordFailedSavingsTransaction(input: {
+    userId: string;
+    type: "deposit" | "withdrawal";
+    amount: number;
+    vaultContractId?: string;
+    transactionHash?: string | null;
+    currency?: string;
+    errorMessage: string;
+  }): Promise<{ transaction: typeof savingsHistory.$inferSelect }> {
+    const amount = Number(input.amount);
+    const vaultContractId =
+      input.vaultContractId?.trim() || process.env.DEFINDEX_VAULT_CONTRACT_ID;
+    const transactionHash = input.transactionHash?.trim() || null;
+    if (!input.userId) {
+      throw new DefindexServiceError("userId is required", "validation");
+    }
+    if (input.type !== "deposit" && input.type !== "withdrawal") {
+      throw new DefindexServiceError("Invalid savings transaction type", "validation");
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new DefindexServiceError(
+        "Savings amount must be greater than zero",
+        "validation",
+      );
+    }
+    if (!vaultContractId) {
+      throw new DefindexServiceError(
+        "Vault contract id is required to record a savings transaction",
+        "validation",
+      );
+    }
+    if (!input.errorMessage?.trim()) {
+      throw new DefindexServiceError("Error message is required", "validation");
+    }
+    if (transactionHash && !/^[a-fA-F0-9]{64}$/.test(transactionHash)) {
+      throw new DefindexServiceError(
+        "Transaction hash must be a 64-character hex string",
+        "validation",
+      );
+    }
+    const currency = input.currency?.trim().toUpperCase() || "USDC";
+
+    try {
+      return await db.transaction(async (tx) => {
+        const [lockedUser] = await tx
+          .select()
+          .from(users)
+          .where(eq(users.id, input.userId))
+          .for("update");
+        if (!lockedUser) {
+          throw new Error("User not found");
+        }
+
+        if (transactionHash) {
+          const existing = await tx.query.savingsHistory.findFirst({
+            where: eq(savingsHistory.transactionHash, transactionHash),
+          });
+          if (existing) {
+            if (existing.userId !== input.userId) {
+              throw new Error("Transaction hash already claimed by another user");
+            }
+            return { transaction: existing };
+          }
+        }
+
+        const [inserted] = await tx
+          .insert(savingsHistory)
+          .values({
+            userId: input.userId,
+            vaultContractId,
+            type: input.type,
+            status: "failed",
+            amount,
+            currency,
+            transactionHash,
+            errorMessage: input.errorMessage.trim(),
+          })
+          .returning();
+        if (!inserted) {
+          throw new Error("Failed to insert savings history entry");
+        }
+        return { transaction: inserted };
+      });
+    } catch (error) {
+      if (error instanceof DefindexServiceError) {
+        throw error;
+      }
+      const err = error instanceof Error ? error : new Error(String(error));
+      throw new DefindexServiceError(
+        `Failed to record failed savings ${input.type} for user ${input.userId}: ${err.message}`,
+        "upstream",
+        err,
+      );
+    }
+  }
+}
+
+/** Input for persisting a confirmed savings deposit/withdrawal. */
+export interface RecordSavingsTransactionInput {
+  userId: string;
+  type: "deposit" | "withdrawal";
+  amount: number;
+  vaultContractId?: string;
+  transactionHash: string;
+  currency?: string;
+  sharesToBurn?: number | null;
+  sharePrice?: number | null;
+  sharesBalance?: number | null;
+}
+
+/** Result of a transactional savings write. */
+export interface RecordedSavingsTransaction {
+  transaction: typeof savingsHistory.$inferSelect;
+  savingsBalance: number;
 }

@@ -2,11 +2,16 @@
 
 import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { validateGiftPricing } from "@/lib/pricing";
 import { ACCESS_TOKEN_COOKIE } from "@/lib/cookies";
 import { db } from "@/lib/db";
-import { transactions, wallets } from "@/lib/db/schema";
+import {
+  savingsHistory,
+  transactions,
+  users,
+  wallets,
+} from "@/lib/db/schema";
 import { verifyAccessToken } from "@/lib/tokens";
 
 export interface PendingSavingsTransactionInput {
@@ -111,6 +116,245 @@ export async function recordPendingSavingsTransaction(
 
   revalidatePath("/dashboard");
   return { success: true, transaction };
+}
+
+export interface SuccessfulSavingsTransactionInput {
+  userId: string;
+  type: "deposit" | "withdrawal";
+  amount: number;
+  vaultContractId: string;
+  transactionHash: string;
+  currency?: string;
+  sharesToBurn?: number | null;
+  sharePrice?: number | null;
+  sharesBalance?: number | null;
+}
+
+export interface FailedSavingsTransactionInput {
+  userId: string;
+  type: "deposit" | "withdrawal";
+  amount: number;
+  vaultContractId: string;
+  transactionHash?: string | null;
+  currency?: string;
+  errorMessage: string;
+}
+
+function validateSuccessfulSavingsInput(input: SuccessfulSavingsTransactionInput) {
+  const amount = Number(input.amount);
+  const transactionHash = input.transactionHash?.trim();
+  const vaultContractId = input.vaultContractId?.trim();
+  if (!input.userId) {
+    return { error: "userId is required" as const };
+  }
+  if (input.type !== "deposit" && input.type !== "withdrawal") {
+    return { error: "Invalid transaction type" as const };
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { error: "Amount must be greater than zero" as const };
+  }
+  if (!vaultContractId) {
+    return { error: "Vault contract id is required" as const };
+  }
+  if (!transactionHash || !/^[a-fA-F0-9]{64}$/.test(transactionHash)) {
+    return {
+      error:
+        "Valid 64-character blockchain transaction hash is required" as const,
+    };
+  }
+  return { amount, transactionHash, vaultContractId };
+}
+
+/**
+ * Records a successful (on-chain confirmed) savings deposit or withdrawal.
+ *
+ * All writes run inside a single `db.transaction()` block:
+ * 1. Lock the user's ledger row (`SELECT ... FOR UPDATE`) so concurrent
+ *    deposits/withdrawals for the same user are serialized.
+ * 2. Conflict check — an existing `savings_history` entry with the same
+ *    `transaction_hash` is returned idempotently; a hash owned by another
+ *    user aborts the transaction.
+ * 3. Insert the `savings_history` entry with status `completed`.
+ * 4. Update the cached `users.savings_balance` / `users.savings_status`.
+ *
+ * Any failure throws inside the callback, rolling the transaction back so
+ * the local database never diverges from the Stellar blockchain with a
+ * partial write.
+ */
+export async function recordSuccessfulSavingsTransaction(
+  input: SuccessfulSavingsTransactionInput,
+) {
+  const validated = validateSuccessfulSavingsInput(input);
+  if ("error" in validated) {
+    return { success: false, error: validated.error };
+  }
+  const { amount, transactionHash, vaultContractId } = validated;
+  const currency = input.currency?.trim().toUpperCase() || "USDC";
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      // 1. Lock the user's ledger row to serialize concurrent savings writes.
+      const [lockedUser] = await tx
+        .select()
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .for("update");
+      if (!lockedUser) {
+        throw new Error("User not found");
+      }
+
+      // 2. Conflict detection — idempotent replay of the same on-chain hash.
+      const existing = await tx.query.savingsHistory.findFirst({
+        where: eq(savingsHistory.transactionHash, transactionHash),
+      });
+      if (existing) {
+        if (existing.userId !== input.userId) {
+          throw new Error("Transaction hash already claimed by another user");
+        }
+        return { transaction: existing, balance: lockedUser.savingsBalance };
+      }
+
+      // 3. Withdrawals must not overdraw the cached ledger balance.
+      if (
+        input.type === "withdrawal" &&
+        Number(lockedUser.savingsBalance || 0) < amount
+      ) {
+        throw new Error("Insufficient savings balance");
+      }
+
+      // 4. Insert the history entry.
+      const [inserted] = await tx
+        .insert(savingsHistory)
+        .values({
+          userId: input.userId,
+          vaultContractId,
+          type: input.type,
+          status: "completed",
+          amount,
+          currency,
+          transactionHash,
+          sharesToBurn: input.sharesToBurn ?? null,
+          sharePrice: input.sharePrice ?? null,
+          sharesBalance: input.sharesBalance ?? null,
+        })
+        .returning();
+      if (!inserted) {
+        throw new Error("Failed to insert savings history entry");
+      }
+
+      // 5. Update the cached savings balance atomically.
+      const [updatedUser] = await tx
+        .update(users)
+        .set({
+          savingsBalance:
+            input.type === "deposit"
+              ? sql`${users.savingsBalance} + ${amount}`
+              : sql`${users.savingsBalance} - ${amount}`,
+          savingsStatus: "active",
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, input.userId))
+        .returning({
+          savingsBalance: users.savingsBalance,
+        });
+      if (!updatedUser) {
+        throw new Error("Failed to update savings balance");
+      }
+
+      return { transaction: inserted, balance: updatedUser.savingsBalance };
+    });
+
+    revalidatePath("/dashboard");
+    return { success: true, ...result };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return { success: false, error: message };
+  }
+}
+
+/**
+ * Records a failed savings deposit/withdrawal without touching the cached
+ * balance. Still runs inside `db.transaction()` with the user row locked so
+ * the failure marker and any concurrent success cannot interleave into a
+ * partial state; any error rolls the whole block back.
+ */
+export async function recordFailedSavingsTransaction(
+  input: FailedSavingsTransactionInput,
+) {
+  const amount = Number(input.amount);
+  const vaultContractId = input.vaultContractId?.trim();
+  const transactionHash = input.transactionHash?.trim() || null;
+  if (!input.userId) {
+    return { success: false, error: "userId is required" };
+  }
+  if (input.type !== "deposit" && input.type !== "withdrawal") {
+    return { success: false, error: "Invalid transaction type" };
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { success: false, error: "Amount must be greater than zero" };
+  }
+  if (!vaultContractId) {
+    return { success: false, error: "Vault contract id is required" };
+  }
+  if (!input.errorMessage?.trim()) {
+    return { success: false, error: "Error message is required" };
+  }
+  if (transactionHash && !/^[a-fA-F0-9]{64}$/.test(transactionHash)) {
+    return {
+      success: false,
+      error: "Transaction hash must be a 64-character hex string",
+    };
+  }
+  const currency = input.currency?.trim().toUpperCase() || "USDC";
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      const [lockedUser] = await tx
+        .select()
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .for("update");
+      if (!lockedUser) {
+        throw new Error("User not found");
+      }
+
+      if (transactionHash) {
+        const existing = await tx.query.savingsHistory.findFirst({
+          where: eq(savingsHistory.transactionHash, transactionHash),
+        });
+        if (existing) {
+          if (existing.userId !== input.userId) {
+            throw new Error("Transaction hash already claimed by another user");
+          }
+          return { transaction: existing };
+        }
+      }
+
+      const [inserted] = await tx
+        .insert(savingsHistory)
+        .values({
+          userId: input.userId,
+          vaultContractId,
+          type: input.type,
+          status: "failed",
+          amount,
+          currency,
+          transactionHash,
+          errorMessage: input.errorMessage.trim(),
+        })
+        .returning();
+      if (!inserted) {
+        throw new Error("Failed to insert savings history entry");
+      }
+      return { transaction: inserted };
+    });
+
+    revalidatePath("/dashboard");
+    return { success: true, ...result };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return { success: false, error: message };
+  }
 }
 
 /** Validates gift pricing and refreshes the dashboard after creation. */
