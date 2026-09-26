@@ -1,8 +1,11 @@
 import {
+  Account,
   Address,
+  Contract,
   Keypair,
   SorobanDataBuilder,
   StrKey,
+  TransactionBuilder,
   nativeToScVal,
   scValToNative,
   xdr,
@@ -10,6 +13,7 @@ import {
 import {
   DefindexService,
   DefindexServiceError,
+  parseUsdcAmount,
 } from "../../src/lib/services/defindex_service";
 
 jest.mock("@defindex/sdk", () => {
@@ -136,6 +140,17 @@ function invokedMethod(tx: any): string {
 function hostFunctionOf(envelope: xdr.TransactionEnvelope): xdr.HostFunction {
   const op = envelope.v1().tx().operations()[0];
   return (op.body().value() as any).hostFunction() as xdr.HostFunction;
+}
+
+function sdkDepositXdr(): string {
+  return new TransactionBuilder(new Account(USER_ADDRESS, "0"), {
+    fee: "100",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  })
+    .addOperation(new Contract(VAULT_CONTRACT_ID).call("deposit"))
+    .setTimeout(30)
+    .build()
+    .toXDR();
 }
 
 describe("DefindexService.calculateWithdrawalParams", () => {
@@ -381,7 +396,41 @@ describe("DefindexService.calculateWithdrawalParams", () => {
   });
 });
 
-describe("DefindexService.calculateDepositParams", () => {
+describe("parseUsdcAmount", () => {
+  it.each([
+    ["50", 500000000n],
+    ["50.00", 500000000n],
+    ["0.0000001", 1n],
+    ["0001.2300000", 12300000n],
+    [" 50.1234567 ", 501234567n],
+  ])("converts %s to exact 7-decimal units", (amount, expected) => {
+    expect(parseUsdcAmount(amount)).toBe(expected);
+  });
+
+  it.each([
+    "",
+    "0",
+    "0.0000000",
+    "-1",
+    "+1",
+    ".5",
+    "1.",
+    "1.00000001",
+    "1e2",
+    "1,000",
+    "1 0",
+  ])("rejects invalid human USDC amount %s", (amount) => {
+    expect(() => parseUsdcAmount(amount)).toThrow(/Invalid USDC amount/);
+  });
+
+  it("rejects an amount outside Soroban's i128 range", () => {
+    expect(() =>
+      parseUsdcAmount("340282366920938463463374607431768211456"),
+    ).toThrow(/i128 range/);
+  });
+});
+
+describe("DefindexService deposit XDR builders", () => {
   const DEPOSIT_AMOUNT = "100000000"; // 10 USDC
 
   beforeEach(() => {
@@ -391,6 +440,12 @@ describe("DefindexService.calculateDepositParams", () => {
     delete process.env.STELLAR_NETWORK_PASSPHRASE;
 
     mockGetHealth.mockResolvedValue({ status: "healthy" });
+    mockDepositToVault.mockResolvedValue({
+      xdr: sdkDepositXdr(),
+      simulationResponse: {},
+      functionName: "deposit",
+      params: [],
+    });
     mockSimulateTransaction.mockImplementation(async (tx: any) => {
       switch (invokedMethod(tx)) {
         case "total_supply":
@@ -399,10 +454,6 @@ describe("DefindexService.calculateDepositParams", () => {
           return successResponse(managedFundsResponse());
         case "balance_of":
           return successResponse(nativeToScVal(BALANCE_OF, { type: "i128" }));
-        case "deposit":
-          return successResponse(
-            nativeToScVal(100n, { type: "i128" }),
-          );
         default:
           throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
       }
@@ -412,6 +463,25 @@ describe("DefindexService.calculateDepositParams", () => {
   afterEach(() => {
     delete process.env.DEFINDEX_VAULT_CONTRACT_ID;
     delete process.env.SOROBAN_RPC_URL;
+  });
+
+  it("builds a simulated SDK XDR from a human-readable USDC amount", async () => {
+    const result = await DefindexService.buildDeFindexDepositXdr(
+      USER_ADDRESS,
+      "50.00",
+    );
+
+    expect(result.amount).toBe("500000000");
+    expect(result.estimatedShares).toBe("500");
+    expect(result.unsignedXdr).toBeTruthy();
+    expect(result.txHash).toMatch(/^[0-9a-f]{64}$/);
+
+    expect(result.unsignedXdr).toBe(sdkDepositXdr());
+    expect(mockDepositToVault).toHaveBeenCalledWith(
+      VAULT_CONTRACT_ID,
+      { amounts: [500000000], caller: USER_ADDRESS, invest: true },
+      "testnet",
+    );
   });
 
   it("computes deposit parameters and returns an unsigned deposit XDR", async () => {
@@ -435,35 +505,7 @@ describe("DefindexService.calculateDepositParams", () => {
     expect(result.txHash).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("builds a deposit invocation with the correct Soroban arguments", async () => {
-    const result = await DefindexService.calculateDepositParams(
-      USER_ADDRESS,
-      DEPOSIT_AMOUNT,
-    );
-
-    const envelope = xdr.TransactionEnvelope.fromXDR(
-      result.unsignedXdr,
-      "base64",
-    );
-    const hostFunction = hostFunctionOf(envelope);
-    const contractArgs = hostFunction.invokeContract();
-
-    expect(contractArgs.functionName().toString()).toBe("deposit");
-    expect(
-      StrKey.encodeContract(
-        contractArgs.contractAddress().contractId() as unknown as Buffer,
-      ),
-    ).toBe(VAULT_CONTRACT_ID);
-
-    const args = contractArgs.args();
-    expect(args).toHaveLength(2);
-
-    expect(args[0].switch().name).toBe("scvI128");
-    expect(scValToNative(args[0])).toBe(BigInt(DEPOSIT_AMOUNT));
-    expect(scValToNative(args[1])).toBe(USER_ADDRESS);
-  });
-
-  it("queries total_supply, managed funds and balance_of over Soroban RPC and simulates the deposit", async () => {
+  it("queries only vault metadata over Soroban RPC and delegates the deposit simulation to the SDK", async () => {
     await DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT);
 
     const simulatedMethods = mockSimulateTransaction.mock.calls.map(([tx]) =>
@@ -473,8 +515,12 @@ describe("DefindexService.calculateDepositParams", () => {
       "total_supply",
       "fetch_total_managed_funds",
       "balance_of",
-      "deposit",
     ]);
+    expect(mockDepositToVault).toHaveBeenCalledWith(
+      VAULT_CONTRACT_ID,
+      { amounts: [100000000], caller: USER_ADDRESS, invest: true },
+      "testnet",
+    );
   });
 
   it("assumes a 1:1 share price when the vault is empty", async () => {
@@ -486,10 +532,6 @@ describe("DefindexService.calculateDepositParams", () => {
           return successResponse(managedFundsResponse(0n));
         case "balance_of":
           return successResponse(nativeToScVal(0n, { type: "i128" }));
-        case "deposit":
-          return successResponse(
-            nativeToScVal(BigInt(DEPOSIT_AMOUNT), { type: "i128" }),
-          );
         default:
           throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
       }
@@ -538,57 +580,44 @@ describe("DefindexService.calculateDepositParams", () => {
     ).rejects.toThrow(/Failed to query total_supply/);
   });
 
-  it("throws when the deposit simulation reports an error", async () => {
-    mockSimulateTransaction.mockImplementation(async (tx: any) => {
-      switch (invokedMethod(tx)) {
-        case "total_supply":
-          return successResponse(nativeToScVal(TOTAL_SUPPLY, { type: "i128" }));
-        case "fetch_total_managed_funds":
-          return successResponse(managedFundsResponse());
-        case "balance_of":
-          return successResponse(nativeToScVal(BALANCE_OF, { type: "i128" }));
-        case "deposit":
-          return errorResponse("HostError: vault paused");
-        default:
-          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
-      }
-    });
+  it("fails upstream when the SDK deposit call fails", async () => {
+    mockDepositToVault.mockRejectedValueOnce(new Error("vault paused"));
 
     await expect(
       DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
-    ).rejects.toThrow(/Deposit simulation failed/);
+    ).rejects.toMatchObject({
+      kind: "upstream",
+      message: expect.stringContaining("Failed to build simulated DeFindex deposit"),
+    });
   });
 
-  it("falls back to the un-simulated XDR when the RPC is unreachable", async () => {
-    mockSimulateTransaction.mockImplementation(async (tx: any) => {
-      if (invokedMethod(tx) === "deposit") {
-        throw new Error("network down");
-      }
-      switch (invokedMethod(tx)) {
-        case "total_supply":
-          return successResponse(nativeToScVal(TOTAL_SUPPLY, { type: "i128" }));
-        case "fetch_total_managed_funds":
-          return successResponse(managedFundsResponse());
-        case "balance_of":
-          return successResponse(nativeToScVal(BALANCE_OF, { type: "i128" }));
-        default:
-          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
-      }
+  it("fails upstream when the SDK returns an empty XDR", async () => {
+    mockDepositToVault.mockResolvedValueOnce({ xdr: "", simulationResponse: {} });
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toMatchObject({
+      kind: "upstream",
+      message: expect.stringContaining("returned no transaction XDR"),
     });
+  });
 
-    const result = await DefindexService.calculateDepositParams(
-      USER_ADDRESS,
-      DEPOSIT_AMOUNT,
-    );
+  it("fails upstream when the SDK omits its simulation response", async () => {
+    mockDepositToVault.mockResolvedValueOnce({ xdr: sdkDepositXdr() });
 
-    expect(result.estimatedShares).toBe("100");
-    const envelope = xdr.TransactionEnvelope.fromXDR(
-      result.unsignedXdr,
-      "base64",
-    );
-    expect(hostFunctionOf(envelope).invokeContract().functionName().toString()).toBe(
-      "deposit",
-    );
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toMatchObject({
+      kind: "upstream",
+      message: expect.stringContaining("returned no simulation response"),
+    });
+  });
+
+  it("rejects amounts the SDK cannot represent safely", async () => {
+    await expect(
+      DefindexService.buildDeFindexDepositXdr(USER_ADDRESS, "900719925.4740992"),
+    ).rejects.toMatchObject({ kind: "validation" });
+    expect(mockDepositToVault).not.toHaveBeenCalled();
   });
 
   it("wraps unexpected errors in DefindexServiceError", async () => {
@@ -886,4 +915,3 @@ describe("DefindexService.getVaultBalance", () => {
     expect(result.rawUserBalance).toBe(BALANCE_OF.toString());
   });
 });
-
