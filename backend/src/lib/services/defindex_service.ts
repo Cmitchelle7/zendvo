@@ -1,9 +1,8 @@
 // DeFindex Service
 // Instantiates the official DeFindex server SDK and a Soroban RPC client to
 // query vault parameters, estimate yield rates (APY), and build unsigned
-// smart-contract invocations. Deposit/withdrawal parameter calculation still
-// queries vault state over RPC so the returned XDR carries a simulated
-// contract footprint.
+// smart-contract invocations. Deposit parameter calculation queries vault
+// state over RPC for metadata; its final simulated XDR comes from the SDK.
 //
 // Environment variables:
 // - DEFINDEX_VAULT_CONTRACT_ID: address (C...) of the DeFindex vault contract
@@ -221,6 +220,40 @@ export function formatUnits(value: bigint, decimals: number = 7): string {
   return `${isNegative ? "-" : ""}${integerPart}.${fractionalPart}`;
 }
 
+const USDC_DECIMALS = 7;
+const MAX_I128 = (1n << 127n) - 1n;
+
+/**
+ * Converts a human-readable USDC amount to Soroban's 7-decimal integer
+ * representation without ever passing through a JavaScript number.
+ */
+export function parseUsdcAmount(amount: string): bigint {
+  const normalized = amount.trim();
+  const match = /^(\d+)(?:\.(\d{1,7}))?$/.exec(normalized);
+  if (!match) {
+    throw new DefindexServiceError(
+      `Invalid USDC amount "${amount}": expected a positive decimal amount with at most ${USDC_DECIMALS} decimal places`,
+      "validation",
+    );
+  }
+
+  const units = BigInt(match[1]) * 10n ** BigInt(USDC_DECIMALS) +
+    BigInt((match[2] || "").padEnd(USDC_DECIMALS, "0") || "0");
+  if (units <= 0n) {
+    throw new DefindexServiceError(
+      `Invalid USDC amount "${amount}": must be greater than zero`,
+      "validation",
+    );
+  }
+  if (units > MAX_I128) {
+    throw new DefindexServiceError(
+      `Invalid USDC amount "${amount}": exceeds the Soroban i128 range`,
+      "validation",
+    );
+  }
+  return units;
+}
+
 interface CacheEntry<T> {
   data: T;
   expiresAt: number;
@@ -353,9 +386,15 @@ function toVaultInvocation(
   contractId: string,
   client: DefindexClient,
 ): VaultInvocation {
-  if (!response.xdr) {
+  if (!response.xdr || !response.xdr.trim()) {
     throw new DefindexServiceError(
       `DeFindex SDK returned no transaction XDR for ${fallbackFunctionName} on vault ${contractId}`,
+      "upstream",
+    );
+  }
+  if (fallbackFunctionName === "deposit" && response.simulationResponse == null) {
+    throw new DefindexServiceError(
+      `DeFindex SDK returned no simulation response for deposit on vault ${contractId}`,
       "upstream",
     );
   }
@@ -1068,6 +1107,27 @@ export class DefindexService {
     }
   }
 
+  /**
+   * Builds a fully simulated, resource-fee assembled DeFindex deposit XDR
+   * from a human-readable USDC amount (for example, "50.00").
+   *
+   * The returned `amount` remains the 7-decimal smallest-unit value for
+   * backwards compatibility with existing clients.
+   */
+  static async buildDeFindexDepositXdr(
+    userAddress: string,
+    amount: string,
+  ): Promise<DepositParams> {
+    return DefindexService.calculateDepositParams(
+      userAddress,
+      parseUsdcAmount(amount).toString(),
+    );
+  }
+
+  /**
+   * Legacy smallest-unit deposit builder. New callers should use
+   * buildDeFindexDepositXdr with a human-readable USDC amount instead.
+   */
   static async calculateDepositParams(
     userAddress: string,
     amount: string,
@@ -1089,9 +1149,16 @@ export class DefindexService {
         "validation",
       );
     }
+    if (amountN > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new DefindexServiceError(
+        `Invalid deposit amount "${amount}": exceeds JavaScript safe integer range required by the DeFindex SDK`,
+        "validation",
+      );
+    }
 
     const contractId = requireVaultContractId();
-    const { server, rpcUrl, networkPassphrase } = DefindexService.createClient();
+    const client = DefindexService.createClient();
+    const { server, rpcUrl, networkPassphrase } = client;
 
     try {
       const totalSupply = BigInt(
@@ -1176,43 +1243,55 @@ export class DefindexService {
         ) as bigint,
       );
 
-      const contract = new Contract(contractId);
-      const depositOp = contract.call(
-        "deposit",
-        nativeToScVal(amountN, { type: "i128" }),
-        Address.fromString(userAddress).toScVal(),
-      );
-
-      const sourceAccount = new Account(userAddress, "0");
-      const tx = new TransactionBuilder(sourceAccount, {
-        fee: "100",
-        networkPassphrase,
-      })
-        .addOperation(depositOp)
-        .setTimeout(30)
-        .setSorobanData(new SorobanDataBuilder().build())
-        .build();
-
-      let finalTx = tx;
+      let sdkResponse: VaultTransactionResponse;
       try {
-        const simulation = await server.simulateTransaction(tx);
-        if (simulation && !("error" in simulation) && simulation.transactionData) {
-          finalTx = rpc.assembleTransaction(tx, simulation).build();
-        } else {
-          const simulationError = (simulation as rpc.Api.SimulateTransactionErrorResponse)
-            ?.error;
-          if (simulationError) {
-            throw new DefindexServiceError(
-              `Deposit simulation failed for vault ${contractId}: ${simulationError}`,
-              "upstream",
-            );
-          }
-        }
+        sdkResponse = await client.sdk.depositToVault(
+          contractId,
+          {
+            amounts: [Number(amountN)],
+            caller: userAddress,
+            invest: true,
+          },
+          client.network,
+        );
       } catch (error) {
         if (error instanceof DefindexServiceError) {
           throw error;
         }
-        finalTx = tx;
+        const err = error instanceof Error ? error : new Error(String(error));
+        throw new DefindexServiceError(
+          `Failed to build simulated DeFindex deposit for vault ${contractId}: ${err.message}`,
+          "upstream",
+          err,
+        );
+      }
+
+      if (!sdkResponse.xdr || !sdkResponse.xdr.trim()) {
+        throw new DefindexServiceError(
+          `DeFindex SDK returned no transaction XDR for deposit on vault ${contractId}`,
+          "upstream",
+        );
+      }
+      if (sdkResponse.simulationResponse == null) {
+        throw new DefindexServiceError(
+          `DeFindex SDK returned no simulation response for deposit on vault ${contractId}`,
+          "upstream",
+        );
+      }
+
+      let sdkTransaction;
+      try {
+        sdkTransaction = TransactionBuilder.fromXDR(
+          sdkResponse.xdr,
+          networkPassphrase,
+        );
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        throw new DefindexServiceError(
+          `DeFindex SDK returned invalid transaction XDR for deposit on vault ${contractId}: ${err.message}`,
+          "upstream",
+          err,
+        );
       }
 
       return {
@@ -1226,8 +1305,8 @@ export class DefindexService {
         contractId,
         networkPassphrase,
         rpcUrl,
-        unsignedXdr: finalTx.toXDR(),
-        txHash: finalTx.hash().toString("hex"),
+        unsignedXdr: sdkResponse.xdr,
+        txHash: sdkTransaction.hash().toString("hex"),
       };
     } catch (error) {
       if (error instanceof DefindexServiceError) {
@@ -1520,4 +1599,12 @@ export interface RecordSavingsTransactionInput {
 export interface RecordedSavingsTransaction {
   transaction: typeof savingsHistory.$inferSelect;
   savingsBalance: number;
+}
+
+/** Convenience export for callers that consume this service as functions. */
+export async function buildDeFindexDepositXdr(
+  userAddress: string,
+  amount: string,
+): Promise<DepositParams> {
+  return DefindexService.buildDeFindexDepositXdr(userAddress, amount);
 }
