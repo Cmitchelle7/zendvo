@@ -70,7 +70,10 @@ class StellarKeypairSerializer {
   Future<void> saveKeyPair(KeyPair keyPair) async {
     Uint8List? rawSeed;
     try {
-      rawSeed = keyPair.rawSecretKey;
+      rawSeed = keyPair.privateKey;
+      if (rawSeed == null) {
+        throw KeypairSerializationStorageException('KeyPair does not contain a private key.');
+      }
       final encoded = base64Encode(rawSeed);
       await _secureStorage.saveSecretSeed(encoded);
     } on SecureStorageException catch (e) {
@@ -115,7 +118,7 @@ class StellarKeypairSerializer {
         );
       }
 
-      return KeyPair.fromSecretSeed(rawSeed);
+      return KeyPair.fromSecretSeedList(rawSeed);
     } on SecureStorageException catch (e) {
       throw KeypairSerializationStorageException(
         'Failed to read keypair from secure storage.',
@@ -158,7 +161,7 @@ class StellarKeypairSerializer {
   /// Exposed for testing and for callers that need a string representation
   /// without touching platform storage. The intermediate buffer is zeroed.
   static String encodeSeed(KeyPair keyPair) {
-    final rawSeed = keyPair.rawSecretKey;
+    final rawSeed = keyPair.privateKey!;
     try {
       return base64Encode(rawSeed);
     } finally {
@@ -188,7 +191,7 @@ class StellarKeypairSerializer {
       }
 
       // KeyPair copies the bytes internally, so zeroing afterwards is safe.
-      return KeyPair.fromSecretSeed(rawSeed);
+      return KeyPair.fromSecretSeedList(rawSeed);
     } finally {
       if (rawSeed != null) {
         zeroize(rawSeed);

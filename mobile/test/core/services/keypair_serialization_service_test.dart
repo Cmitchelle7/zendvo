@@ -116,7 +116,7 @@ void main() {
       expect(decoded.length, equals(32));
       expect(
         decoded,
-        equals(keyPair.rawSecretKey),
+        equals(keyPair.privateKey),
       );
     });
 
