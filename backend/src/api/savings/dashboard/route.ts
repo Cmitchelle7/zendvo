@@ -10,6 +10,16 @@ import {
   type HistoricalSharePriceSnapshot,
 } from "@/lib/services/defindex_service";
 
+/**
+ * GET /api/savings/dashboard
+ *
+ * Retrieves aggregated real-time savings dashboard data for the authenticated user,
+ * including on-chain DeFindex vault balances, underlying USDC values, estimated APY,
+ * and recent savings transactions.
+ *
+ * @param request - NextRequest containing the bearer authorization token and optional query parameters.
+ * @returns NextResponse with the formatted savings dashboard data or RFC-7807 problem details.
+ */
 export async function GET(request: NextRequest) {
   try {
     // 1. Authenticate user
@@ -57,10 +67,22 @@ export async function GET(request: NextRequest) {
 
     const userAddress = user.stellarAddress.trim();
 
-    // 3. Extract query parameters
+    // 3. Extract and validate vault contract ID
     const url = request.nextUrl ?? new URL(request.url);
+    const requestedVaultId = url.searchParams.get("vaultContractId")?.trim();
+
+    // Enforce that a caller cannot query a foreign vault if the account is bound to a registered vault
+    if (requestedVaultId && user.vaultContractId && requestedVaultId !== user.vaultContractId) {
+      return createProblemDetails(
+        "about:blank",
+        "Bad Request",
+        400,
+        "Requested vault does not match the account's registered vault",
+      );
+    }
+
     const vaultContractId =
-      url.searchParams.get("vaultContractId") ||
+      requestedVaultId ||
       user.vaultContractId ||
       process.env.DEFINDEX_VAULT_CONTRACT_ID;
 
@@ -83,6 +105,7 @@ export async function GET(request: NextRequest) {
             eq(savingsHistory.type, "deposit"),
             eq(savingsHistory.status, "completed"),
             isNotNull(savingsHistory.sharePrice),
+            ...(vaultContractId ? [eq(savingsHistory.vaultContractId, vaultContractId)] : []),
           ),
         )
         .orderBy(desc(savingsHistory.createdAt))
@@ -149,7 +172,12 @@ export async function GET(request: NextRequest) {
           createdAt: savingsHistory.createdAt,
         })
         .from(savingsHistory)
-        .where(eq(savingsHistory.userId, user.id))
+        .where(
+          and(
+            eq(savingsHistory.userId, user.id),
+            ...(vaultContractId ? [eq(savingsHistory.vaultContractId, vaultContractId)] : []),
+          ),
+        )
         .orderBy(desc(savingsHistory.createdAt))
         .limit(5);
     } catch {

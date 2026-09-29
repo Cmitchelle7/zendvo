@@ -215,6 +215,32 @@ describe("GET /api/savings/dashboard", () => {
     );
   });
 
+  it("returns 400 when requested vaultContractId does not match the account's registered vault", async () => {
+    mockGetAuthPayload.mockResolvedValue({ userId: "user-123" });
+    mockFindFirst.mockResolvedValue({
+      id: "user-123",
+      stellarAddress: TEST_STELLAR_ADDRESS,
+      vaultContractId: TEST_VAULT_CONTRACT_ID,
+      savingsStatus: "active",
+      savingsBalance: 10,
+    });
+    const FOREIGN_VAULT = "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDFFFF";
+
+    const res = await GET(
+      createRequest(
+        `http://localhost/api/savings/dashboard?vaultContractId=${FOREIGN_VAULT}`,
+      ),
+    );
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json.title).toBe("Bad Request");
+    expect(json.detail).toBe(
+      "Requested vault does not match the account's registered vault",
+    );
+    expect(mockGetVaultBalance).not.toHaveBeenCalled();
+  });
+
   it("falls back to DefindexService.estimateApy when historical APY is null", async () => {
     mockGetAuthPayload.mockResolvedValue({ userId: "user-123" });
     mockFindFirst.mockResolvedValue({
