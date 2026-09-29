@@ -111,6 +111,67 @@ class SavingsRepository {
     }
   }
 
+  /// Submits a signed withdrawal XDR envelope to the backend with targeted
+  /// error mapping for withdrawal-specific failure conditions.
+  ///
+  /// Unlike [submitSignedXdr] (which is a generic relay), this method posts
+  /// to the same `/api/transactions/submit` endpoint but interprets the
+  /// response in the context of a withdrawal operation:
+  ///
+  /// - HTTP 422 → [InsufficientVaultFundsException]: the vault does not hold
+  ///   enough shares or USDC to honour the requested withdrawal amount.  The
+  ///   UI can surface a targeted message (e.g. "Insufficient vault funds –
+  ///   try a smaller amount") rather than a generic network error.
+  /// - HTTP 400 → [TransactionFailedException]: the XDR was rejected by the
+  ///   network (bad signature, invalid sequence number, etc.).
+  /// - HTTP 503/5xx after retries → [NetworkCongestedException]: surfaced by
+  ///   [ApiClient.postWithRetry] after exhausting its backoff strategy.
+  ///
+  /// On success, the on-chain transaction hash is returned and
+  /// [submissionStatus] transitions to [SavingsSubmissionStatus.succeeded].
+  /// On any permanent failure the status reverts to
+  /// [SavingsSubmissionStatus.failed] so the UI is never stuck in a pending
+  /// loop; call [resetSubmissionState] before letting the user retry.
+  Future<String> submitWithdrawalXdr(String signedXdr) async {
+    submissionStatus.value = SavingsSubmissionStatus.submitting;
+    try {
+      final response = await _apiClient.postWithRetry(
+        '$_baseUrl/api/transactions/submit',
+        {'signedXdr': signedXdr},
+      );
+
+      final hash = response['hash'] as String?;
+      if (hash == null || hash.isEmpty) {
+        throw const TransactionFailedException(
+          'The network accepted the withdrawal but did not return a transaction hash.',
+        );
+      }
+
+      submissionStatus.value = SavingsSubmissionStatus.succeeded;
+      return hash;
+    } on ApiRequestException catch (error) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      // HTTP 422: the vault cannot cover the requested withdrawal amount.
+      if (error.statusCode == 422) {
+        throw InsufficientVaultFundsException(
+          error.message,
+          statusCode: error.statusCode,
+          cause: error,
+        );
+      }
+      rethrow;
+    } on ApiException {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      rethrow;
+    } catch (error) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      throw TransactionFailedException(
+        'Failed to submit the withdrawal transaction. Please try again.',
+        cause: error,
+      );
+    }
+  }
+
   /// Reverts the submission state to idle so the user can attempt the action
   /// again without being stuck in a looping "pending" state.
   void resetSubmissionState() {
