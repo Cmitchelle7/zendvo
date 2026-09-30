@@ -13,6 +13,7 @@ import {
   wallets,
 } from "@/lib/db/schema";
 import { verifyAccessToken } from "@/lib/tokens";
+import { TelemetryService } from "@/lib/services/telemetry_service";
 
 export interface PendingSavingsTransactionInput {
   type: "deposit" | "withdrawal";
@@ -264,10 +265,29 @@ export async function recordSuccessfulSavingsTransaction(
       return { transaction: inserted, balance: updatedUser.savingsBalance };
     });
 
+    TelemetryService.logConfirmationSuccess({
+      userId: input.userId,
+      transactionType: input.type,
+      amount,
+      currency,
+      vaultContractId,
+      txHash: transactionHash,
+    });
+
     revalidatePath("/dashboard");
     return { success: true, ...result };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
+    TelemetryService.logConfirmationFailure({
+      userId: input.userId,
+      transactionType: input.type,
+      amount,
+      currency,
+      vaultContractId,
+      txHash: transactionHash,
+      errorCode: "CONFIRMATION_RECORD_FAILED",
+      error: err,
+    });
     return { success: false, error: message };
   }
 }
@@ -349,10 +369,31 @@ export async function recordFailedSavingsTransaction(
       return { transaction: inserted };
     });
 
+    TelemetryService.logConfirmationFailure({
+      userId: input.userId,
+      transactionType: input.type,
+      amount,
+      currency,
+      vaultContractId,
+      txHash: transactionHash ?? undefined,
+      errorCode: "ON_CHAIN_FAILURE",
+      error: input.errorMessage.trim(),
+    });
+
     revalidatePath("/dashboard");
     return { success: true, ...result };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
+    TelemetryService.logConfirmationFailure({
+      userId: input.userId,
+      transactionType: input.type,
+      amount,
+      currency,
+      vaultContractId,
+      txHash: transactionHash ?? undefined,
+      errorCode: "CONFIRMATION_RECORD_FAILED",
+      error: err,
+    });
     return { success: false, error: message };
   }
 }
