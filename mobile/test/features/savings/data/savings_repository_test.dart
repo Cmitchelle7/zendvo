@@ -318,4 +318,65 @@ void main() {
       expect(repository.submissionStatus.value, SavingsSubmissionStatus.failed);
     });
   });
+
+  group('SavingsRepository.requestWithdrawalXdr', () {
+    test('requests unsigned withdrawal XDR from backend', () async {
+      final (server, baseUri) = await startServer((request) async {
+        expect(request.uri.path, '/api/wallet/withdraw');
+        final body = await utf8.decoder.bind(request).join();
+        expect(jsonDecode(body), {'amount': '100.0', 'accountId': 'GXYZ'});
+        return jsonResponse(request, 200, {'unsignedxdr': 'unsigned_withdrawal_xdr'});
+      });
+      addTearDown(() => server.close(force: true));
+
+      final repository = SavingsRepository(
+        apiClient: ApiClient(baseDelay: const Duration(milliseconds: 1)),
+        baseUrl: baseUri.toString(),
+      );
+
+      final xdr = await repository.requestWithdrawalXdr('100.0', 'GXYZ');
+
+      expect(xdr, 'unsigned_withdrawal_xdr');
+    });
+
+    test('throws TransactionFailedException when unsignedxdr is missing', () async {
+      final (server, baseUri) = await startServer((request) async {
+        return jsonResponse(request, 200, {'success': true});
+      });
+      addTearDown(() => server.close(force: true));
+
+      final repository = SavingsRepository(
+        apiClient: ApiClient(baseDelay: const Duration(milliseconds: 1)),
+        baseUrl: baseUri.toString(),
+      );
+
+      await expectLater(
+        repository.requestWithdrawalXdr('100.0', 'GXYZ'),
+        throwsA(
+          isA<TransactionFailedException>().having(
+            (e) => e.message,
+            'message',
+            contains('did not return a withdrawal XDR'),
+          ),
+        ),
+      );
+    });
+
+    test('propagates network errors', () async {
+      final (server, baseUri) = await startServer((request) async {
+        return jsonResponse(request, 500, {'message': 'server error'});
+      });
+      addTearDown(() => server.close(force: true));
+
+      final repository = SavingsRepository(
+        apiClient: ApiClient(baseDelay: const Duration(milliseconds: 1)),
+        baseUrl: baseUri.toString(),
+      );
+
+      await expectLater(
+        repository.requestWithdrawalXdr('100.0', 'GXYZ'),
+        throwsA(isA<ApiException>()),
+      );
+    });
+  });
 }
