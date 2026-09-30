@@ -6,15 +6,33 @@ import {
 import { getAuthPayload } from "@/lib/auth-session";
 import { createProblemDetails } from "@/lib/api-utils";
 import { StrKey } from "@stellar/stellar-sdk";
+import {
+  TelemetryService,
+  extractTraceId,
+} from "@/lib/services/telemetry_service";
 
 // Maximum value for signed 128-bit integer (Soroban/i128 limit)
 const MAX_I128 = (1n << 127n) - 1n;
 
 export async function POST(request: NextRequest) {
+  const traceId = extractTraceId(request);
+  const elapsedTimer = TelemetryService.startTimer();
+  let currentUserId: string | undefined;
+  let requestedAddress: string | undefined;
+  let requestedAmount: string | undefined;
+
   try {
     // 1. Authenticate user
     const payload = await getAuthPayload(request);
     if (!payload) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        transactionType: "withdrawal",
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 401,
+        error: "Authentication required",
+      });
       return createProblemDetails(
         "about:blank",
         "Unauthorized",
@@ -22,6 +40,16 @@ export async function POST(request: NextRequest) {
         "Authentication required",
       );
     }
+
+    const { userId } = payload;
+    currentUserId = userId;
+
+    TelemetryService.logXdrGenerationStart({
+      traceId,
+      userId,
+      transactionType: "withdrawal",
+      currency: "USDC",
+    });
 
     // 2. Parse request body with stream limit check
     const limit = 10 * 1024; // 10KB limit
@@ -87,8 +115,24 @@ export async function POST(request: NextRequest) {
         ? (body as { userAddress?: unknown; amount?: unknown })
         : {};
 
+    if (typeof userAddress === "string") {
+      requestedAddress = userAddress.trim();
+    }
+    if (typeof amount === "string") {
+      requestedAmount = amount.trim();
+    }
+
     // 3. Validate userAddress
     if (typeof userAddress !== "string") {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "userAddress is required and must be a string",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -99,6 +143,15 @@ export async function POST(request: NextRequest) {
 
     const trimmedAddress = userAddress.trim();
     if (!trimmedAddress) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "userAddress is required and cannot be empty",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -108,6 +161,16 @@ export async function POST(request: NextRequest) {
     }
 
     if (!StrKey.isValidEd25519PublicKey(trimmedAddress)) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "Invalid Stellar public key format",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -118,6 +181,16 @@ export async function POST(request: NextRequest) {
 
     // 4. Validate amount
     if (typeof amount !== "string") {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "amount is required and must be a string representation of the withdrawal amount in smallest units",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -128,6 +201,16 @@ export async function POST(request: NextRequest) {
 
     const trimmedAmount = amount.trim();
     if (!trimmedAmount) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "amount is required and cannot be empty",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -138,6 +221,17 @@ export async function POST(request: NextRequest) {
 
     // Must be a positive integer (digits only)
     if (!/^\d+$/.test(trimmedAmount)) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        amount: trimmedAmount,
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "amount must be a valid positive integer in smallest units",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -150,6 +244,17 @@ export async function POST(request: NextRequest) {
     try {
       amountBigInt = BigInt(trimmedAmount);
     } catch {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        amount: trimmedAmount,
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "amount is malformed",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -159,6 +264,17 @@ export async function POST(request: NextRequest) {
     }
 
     if (amountBigInt <= 0n) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        amount: trimmedAmount,
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "amount must be greater than zero",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -168,6 +284,17 @@ export async function POST(request: NextRequest) {
     }
 
     if (amountBigInt > MAX_I128) {
+      TelemetryService.logXdrGenerationFailure({
+        traceId,
+        userId: currentUserId,
+        transactionType: "withdrawal",
+        amount: trimmedAmount,
+        stellarAddress: trimmedAddress,
+        currency: "USDC",
+        durationMs: elapsedTimer(),
+        errorCode: 400,
+        error: "amount is too large to be safely represented as a 128-bit signed integer",
+      });
       return createProblemDetails(
         "about:blank",
         "Bad Request",
@@ -181,6 +308,17 @@ export async function POST(request: NextRequest) {
       trimmedAddress,
       trimmedAmount,
     );
+
+    TelemetryService.logXdrGenerationSuccess({
+      traceId,
+      userId: currentUserId,
+      transactionType: "withdrawal",
+      amount: trimmedAmount,
+      currency: "USDC",
+      stellarAddress: trimmedAddress,
+      txHash: result.txHash,
+      durationMs: elapsedTimer(),
+    });
 
     // 6. Return mapped response
     return NextResponse.json(
@@ -203,6 +341,24 @@ export async function POST(request: NextRequest) {
     );
   } catch (error) {
     console.error("[WALLET_WITHDRAW_ERROR]", error);
+
+    const errorCode =
+      error instanceof DefindexServiceError
+        ? error.kind.toUpperCase()
+        : "INTERNAL_ERROR";
+
+    TelemetryService.logXdrGenerationFailure({
+      traceId,
+      userId: currentUserId,
+      transactionType: "withdrawal",
+      amount: requestedAmount,
+      currency: "USDC",
+      stellarAddress: requestedAddress,
+      durationMs: elapsedTimer(),
+      errorCode,
+      error,
+    });
+
     if (error instanceof DefindexServiceError) {
       switch (error.kind) {
         case "configuration":
