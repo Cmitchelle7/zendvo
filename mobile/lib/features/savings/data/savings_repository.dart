@@ -97,6 +97,34 @@ class SavingsRepository {
     }
   }
 
+  /// Requests an unsigned withdrawal XDR envelope from the backend for the
+  /// given [amount] and [accountId].
+  ///
+  /// Domain exceptions from [ApiClient.postWithRetry] (e.g.
+  /// [TransactionFailedException], [NetworkCongestedException]) are
+  /// rethrown so the caller/UI controller can handle them; this keeps app
+  /// state from getting stuck after a permanent failure.
+  Future<String> requestWithdrawalXdr(String amount, String accountId) async {
+    try {
+      final response = await _apiClient.postWithRetry(
+        '$_baseUrl/api/wallet/withdraw',
+        {'amount': amount, 'accountId': accountId},
+      );
+
+      final unsignedxdr = response['unsignedxdr'] as String?;
+      if (unsignedxdr == null || unsignedxdr.isEmpty) {
+        throw const TransactionFailedException(
+          'The network accepted the request but did not return a withdrawal XDR.',
+        );
+      }
+      return unsignedxdr;
+    } catch (e) {
+      // Re-throw domain exceptions so the UI controller can catch and handle
+      // them properly, keeping app state from looping in "pending".
+      rethrow;
+    }
+  }
+
   /// Submits a signed XDR envelope to the backend relay with automatic
   /// retries for transient network failures.
   ///
