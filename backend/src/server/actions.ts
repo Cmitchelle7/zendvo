@@ -377,7 +377,7 @@ export async function recordFailedSavingsTransaction(
       vaultContractId,
       txHash: transactionHash ?? undefined,
       errorCode: "ON_CHAIN_FAILURE",
-      errorMessage: input.errorMessage.trim(),
+      error: input.errorMessage.trim(),
     });
 
     revalidatePath("/dashboard");

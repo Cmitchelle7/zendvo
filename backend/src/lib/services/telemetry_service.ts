@@ -49,6 +49,7 @@ export interface XdrGenerationLogParams {
   durationMs?: number;
   txHash?: string;
   error?: unknown;
+  errorMessage?: string;
   errorCode?: string | number;
   metadata?: Record<string, unknown>;
 }
@@ -62,6 +63,7 @@ export interface SubmissionLogParams {
   durationMs?: number;
   attempts?: number;
   error?: unknown;
+  errorMessage?: string;
   errorCode?: string | number;
   metadata?: Record<string, unknown>;
 }
@@ -76,6 +78,7 @@ export interface ConfirmationLogParams {
   txHash?: string;
   durationMs?: number;
   error?: unknown;
+  errorMessage?: string;
   errorCode?: string | number;
   metadata?: Record<string, unknown>;
 }
@@ -282,11 +285,12 @@ export class TelemetryService {
 
   static logXdrGenerationFailure(params: XdrGenerationLogParams): TelemetryLog {
     const errorMessage =
-      params.error instanceof Error
+      params.errorMessage ||
+      (params.error instanceof Error
         ? params.error.message
         : typeof params.error === "string"
         ? params.error
-        : "Failed to generate XDR";
+        : "Failed to generate XDR");
 
     return TelemetryService.log({
       level: "error",
@@ -344,11 +348,12 @@ export class TelemetryService {
 
   static logSubmissionFailure(params: SubmissionLogParams): TelemetryLog {
     const errorMessage =
-      params.error instanceof Error
+      params.errorMessage ||
+      (params.error instanceof Error
         ? params.error.message
         : typeof params.error === "string"
         ? params.error
-        : "Network submission failed";
+        : "Network submission failed");
 
     return TelemetryService.log({
       level: "error",
@@ -395,11 +400,12 @@ export class TelemetryService {
 
   static logConfirmationFailure(params: ConfirmationLogParams): TelemetryLog {
     const errorMessage =
-      params.error instanceof Error
+      params.errorMessage ||
+      (params.error instanceof Error
         ? params.error.message
         : typeof params.error === "string"
         ? params.error
-        : "Transaction confirmation failed";
+        : "Transaction confirmation failed");
 
     return TelemetryService.log({
       level: "error",
