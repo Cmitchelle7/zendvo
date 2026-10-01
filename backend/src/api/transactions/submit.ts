@@ -1,10 +1,11 @@
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
-import { transactions, users } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
+import { savingsHistory, transactions, users } from "@/lib/db/schema";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { getAuthPayload } from "@/lib/auth-session";
 import { createProblemDetails } from "@/lib/api-utils";
 import { SubmissionService } from "@/lib/stellar/submission_service";
+import { TransactionBuilder, Networks } from "@stellar/stellar-sdk";
 import {
   TelemetryService,
   extractTraceId,
@@ -94,11 +95,74 @@ export async function POST(request: NextRequest) {
 
     const result = await SubmissionService.submitXdrToNetwork(signedXdr, user.stellarAddress);
 
+    // Look up any matching savings history record for this transaction
+    let targetHash: string | undefined = result.hash;
+    if (!targetHash && signedXdr) {
+      try {
+        const networkPassphrase =
+          process.env.STELLAR_NETWORK === "public"
+            ? Networks.PUBLIC
+            : Networks.TESTNET;
+        const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+        targetHash = tx.hash().toString("hex");
+      } catch {
+        // ignore xdr parse error
+      }
+    }
+
+    let matchingSavingsRecord = null;
+    if (db.query?.savingsHistory) {
+      if (targetHash) {
+        matchingSavingsRecord = await db.query.savingsHistory.findFirst({
+          where: and(
+            eq(savingsHistory.userId, currentUserId),
+            eq(savingsHistory.transactionHash, targetHash),
+          ),
+        });
+      }
+
+      if (!matchingSavingsRecord) {
+        matchingSavingsRecord = await db.query.savingsHistory.findFirst({
+          where: and(
+            eq(savingsHistory.userId, currentUserId),
+            eq(savingsHistory.status, "pending"),
+          ),
+          orderBy: [desc(savingsHistory.createdAt)],
+        });
+      }
+    }
+
     if (result.success && result.hash) {
+      if (matchingSavingsRecord) {
+        await db
+          .update(savingsHistory)
+          .set({
+            status: "completed",
+            transactionHash: result.hash,
+            updatedAt: new Date(),
+          })
+          .where(eq(savingsHistory.id, matchingSavingsRecord.id));
+
+        const recordAmount = matchingSavingsRecord.amount;
+        if (recordAmount > 0) {
+          await db
+            .update(users)
+            .set({
+              savingsBalance:
+                matchingSavingsRecord.type === "deposit"
+                  ? sql`${users.savingsBalance} + ${recordAmount}`
+                  : sql`${users.savingsBalance} - ${recordAmount}`,
+              savingsStatus: "active",
+              updatedAt: new Date(),
+            })
+            .where(eq(users.id, currentUserId));
+        }
+      }
+
       // Log the submitted transaction in the database
       await db.insert(transactions).values({
         userId: currentUserId,
-        amount: 0,
+        amount: matchingSavingsRecord ? matchingSavingsRecord.amount : 0,
         currency: "USDC",
         type: "blockchain_submission" as const,
         status: "submitted" as const,
@@ -129,6 +193,17 @@ export async function POST(request: NextRequest) {
           },
         },
       );
+    }
+
+    if (matchingSavingsRecord) {
+      await db
+        .update(savingsHistory)
+        .set({
+          status: "failed",
+          errorMessage: result.error || "Transaction submission failed",
+          updatedAt: new Date(),
+        })
+        .where(eq(savingsHistory.id, matchingSavingsRecord.id));
     }
 
     TelemetryService.logSubmissionFailure({

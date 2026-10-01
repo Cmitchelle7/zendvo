@@ -6,7 +6,7 @@ import {
 import { getAuthPayload } from "@/lib/auth-session";
 import { createProblemDetails } from "@/lib/api-utils";
 import { db } from "@/lib/db";
-import { users } from "@/lib/db/schema";
+import { savingsHistory, users } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import {
   TelemetryService,
@@ -115,6 +115,22 @@ export async function POST(request: NextRequest) {
       user.stellarAddress,
       amount.trim(),
     );
+
+    try {
+      await db.insert(savingsHistory).values({
+        userId,
+        vaultContractId: result.contractId,
+        type: "deposit",
+        status: "pending",
+        amount: Number(amount.trim()) || Number(result.amount),
+        currency: "USDC",
+        transactionHash: result.txHash,
+        sharePrice: result.sharePrice ? Number(result.sharePrice) : null,
+        sharesBalance: result.userBalance ? Number(result.userBalance) : null,
+      });
+    } catch (dbError) {
+      console.error("[SAVINGS_HISTORY_DEPOSIT_INSERT_ERROR]", dbError);
+    }
 
     TelemetryService.logXdrGenerationSuccess({
       traceId,
