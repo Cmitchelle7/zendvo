@@ -6,6 +6,8 @@ import {
 import { getAuthPayload } from "@/lib/auth-session";
 import { createProblemDetails } from "@/lib/api-utils";
 import { StrKey } from "@stellar/stellar-sdk";
+import { db } from "@/lib/db";
+import { savingsHistory } from "@/lib/db/schema";
 import {
   TelemetryService,
   extractTraceId,
@@ -308,6 +310,25 @@ export async function POST(request: NextRequest) {
       trimmedAddress,
       trimmedAmount,
     );
+
+    if (currentUserId) {
+      try {
+        await db.insert(savingsHistory).values({
+          userId: currentUserId,
+          vaultContractId: result.contractId,
+          type: "withdrawal",
+          status: "pending",
+          amount: Number(trimmedAmount) || Number(result.amount),
+          currency: "USDC",
+          transactionHash: result.txHash,
+          sharesToBurn: result.sharesToBurn ? Number(result.sharesToBurn) : null,
+          sharePrice: result.sharePrice ? Number(result.sharePrice) : null,
+          sharesBalance: result.userBalance ? Number(result.userBalance) : null,
+        });
+      } catch (dbError) {
+        console.error("[SAVINGS_HISTORY_WITHDRAW_INSERT_ERROR]", dbError);
+      }
+    }
 
     TelemetryService.logXdrGenerationSuccess({
       traceId,

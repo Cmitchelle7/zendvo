@@ -212,6 +212,39 @@ export async function recordSuccessfulSavingsTransaction(
         if (existing.userId !== input.userId) {
           throw new Error("Transaction hash already claimed by another user");
         }
+        if (existing.status === "pending") {
+          const [updatedHistory] = await tx
+            .update(savingsHistory)
+            .set({
+              status: "completed",
+              sharesToBurn: input.sharesToBurn ?? existing.sharesToBurn,
+              sharePrice: input.sharePrice ?? existing.sharePrice,
+              sharesBalance: input.sharesBalance ?? existing.sharesBalance,
+              updatedAt: new Date(),
+            })
+            .where(eq(savingsHistory.id, existing.id))
+            .returning();
+
+          const [updatedUser] = await tx
+            .update(users)
+            .set({
+              savingsBalance:
+                input.type === "deposit"
+                  ? sql`${users.savingsBalance} + ${amount}`
+                  : sql`${users.savingsBalance} - ${amount}`,
+              savingsStatus: "active",
+              updatedAt: new Date(),
+            })
+            .where(eq(users.id, input.userId))
+            .returning({
+              savingsBalance: users.savingsBalance,
+            });
+
+          return {
+            transaction: updatedHistory || existing,
+            balance: updatedUser?.savingsBalance,
+          };
+        }
         return { transaction: existing, balance: lockedUser.savingsBalance };
       }
 
@@ -345,6 +378,18 @@ export async function recordFailedSavingsTransaction(
         if (existing) {
           if (existing.userId !== input.userId) {
             throw new Error("Transaction hash already claimed by another user");
+          }
+          if (existing.status === "pending") {
+            const [updatedHistory] = await tx
+              .update(savingsHistory)
+              .set({
+                status: "failed",
+                errorMessage: input.errorMessage.trim(),
+                updatedAt: new Date(),
+              })
+              .where(eq(savingsHistory.id, existing.id))
+              .returning();
+            return { transaction: updatedHistory || existing };
           }
           return { transaction: existing };
         }
