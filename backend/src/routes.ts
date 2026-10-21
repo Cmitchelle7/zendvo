@@ -165,4 +165,17 @@ apiRouter.post(
   makeExpressHandler(walletTrustlinePost),
 );
 
+// Wallet balance
+apiRouter.get("/api/wallet/balance", makeExpressHandler(walletBalanceGet));
+
+// Wallet bank accounts
+apiRouter.get("/api/wallet/banks", makeExpressHandler(bankAccountsGet));
+apiRouter.post("/api/wallet/banks", makeExpressHandler(bankAccountsPost));
+apiRouter.put("/api/wallet/banks/:id", makeExpressHandler(bankAccountsPut));
+apiRouter.delete(
+  "/api/wallet/banks/:id",
+  makeExpressHandler(unlinkBankAccountDelete),
+);
+
+
 
