@@ -83,6 +83,7 @@ import { POST as transactionSubmitPost } from "./api/transactions/submit";
 
 // SEP-24 Webhook
 import { POST as sep24WebhookPost } from "./api/webhooks/sep24/route";
+import { GET as savingsDashboardGet } from "./api/savings/dashboard/route";
 
 export const apiRouter = Router();
 
@@ -91,6 +92,7 @@ apiRouter.post("/api/transactions/submit", makeExpressHandler(transactionSubmitP
 
 // 7. SEP-24 Anchor webhook listener
 apiRouter.post("/api/webhooks/sep24", makeExpressHandler(sep24WebhookPost));
+apiRouter.get("/api/savings/dashboard", makeExpressHandler(savingsDashboardGet));
 
 
 // 1. Authentication routes
