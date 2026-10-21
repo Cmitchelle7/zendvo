@@ -75,6 +75,9 @@ import { POST as verifyOtpPost } from "./api/auth/verify-otp/route";
 import { POST as verifyActionOtpPost } from "./api/auth/action-otp/verify/route";
 import { POST as verifyDeletionOtpPost } from "./api/auth/verify-deletion-otp/route";
 
+// Users
+import { GET as resolveRecipientGet } from "./api/users/resolve/route";
+
 // Upload
 import { POST as uploadImagePost } from "./api/upload/image/route";
 
@@ -137,6 +140,9 @@ apiRouter.post(
   "/api/auth/verify-deletion-otp",
   makeExpressHandler(verifyDeletionOtpPost),
 );
+
+// 2. Users routes
+apiRouter.get("/api/users/resolve", makeExpressHandler(resolveRecipientGet));
 
 
 
