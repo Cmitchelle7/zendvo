@@ -206,6 +206,73 @@ class SavingsRepository {
     submissionStatus.value = SavingsSubmissionStatus.idle;
   }
 
+  /// Submits a signed trustline XDR envelope to the backend with targeted
+  /// error mapping for trustline-specific failure conditions.
+  ///
+  /// This method posts to `/api/transactions/submit` and interprets the
+  /// response in the context of a trustline activation operation:
+  ///
+  /// - HTTP 400 with trustline-specific error codes → [TrustlineActivationException]:
+  ///   The trustline could not be activated (e.g. trustline already exists,
+  ///   asset not authorized, insufficient reserve). The UI can surface a
+  ///   targeted message rather than a generic network error.
+  /// - HTTP 400 → [TransactionFailedException]: the XDR was rejected by the
+  ///   network (bad signature, invalid sequence number, etc.).
+  /// - HTTP 503/5xx after retries → [NetworkCongestedException]: surfaced by
+  ///   [ApiClient.postWithRetry] after exhausting its backoff strategy.
+  ///
+  /// On success, the on-chain transaction hash is returned and
+  /// [submissionStatus] transitions to [SavingsSubmissionStatus.succeeded].
+  /// On any permanent failure the status reverts to
+  /// [SavingsSubmissionStatus.failed] so the UI is never stuck in a pending
+  /// loop; call [resetSubmissionState] before letting the user retry.
+  Future<String> submitTrustlineXdr(String signedXdr) async {
+    submissionStatus.value = SavingsSubmissionStatus.submitting;
+    try {
+      final response = await _apiClient.postWithRetry(
+        '$_baseUrl/api/transactions/submit',
+        {'signedXdr': signedXdr},
+      );
+
+      final hash = response['hash'] as String?;
+      if (hash == null || hash.isEmpty) {
+        throw const TransactionFailedException(
+          'The network accepted the trustline transaction but did not return a transaction hash.',
+        );
+      }
+
+      submissionStatus.value = SavingsSubmissionStatus.succeeded;
+      return hash;
+    } on ApiRequestException catch (error) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      // Check for trustline-specific error conditions
+      if (error.statusCode == 400) {
+        final message = error.message.toLowerCase();
+        if (message.contains('trustline') ||
+            message.contains('already exists') ||
+            message.contains('not authorized') ||
+            message.contains('low reserve') ||
+            message.contains('insufficient reserve')) {
+          throw TrustlineActivationException(
+            error.message,
+            statusCode: error.statusCode,
+            cause: error,
+          );
+        }
+      }
+      rethrow;
+    } on ApiException {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      rethrow;
+    } catch (error) {
+      submissionStatus.value = SavingsSubmissionStatus.failed;
+      throw TransactionFailedException(
+        'Failed to submit the trustline transaction. Please try again.',
+        cause: error,
+      );
+    }
+  }
+
   /// Registers a newly generated Stellar public key with the backend.
   ///
   /// Authentication is supplied by [ApiClient.authTokenProvider]. A duplicate

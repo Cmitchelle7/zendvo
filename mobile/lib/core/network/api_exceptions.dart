@@ -52,3 +52,9 @@ class ApiRequestException extends ApiException {
 class InsufficientVaultFundsException extends ApiException {
   const InsufficientVaultFundsException(super.message, {super.statusCode, super.cause});
 }
+
+/// Thrown when a trustline activation fails due to specific Stellar network
+/// conditions (e.g. trustline already exists, asset not allowed, low reserve).
+class TrustlineActivationException extends ApiException {
+  const TrustlineActivationException(super.message, {super.statusCode, super.cause});
+}
