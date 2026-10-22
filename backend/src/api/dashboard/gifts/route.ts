@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { gifts, users } from "@/lib/db/schema";
+import { gifts, users, giftStatusEnum } from "@/lib/db/schema";
 import { eq, and, or, desc, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { getAuthPayload } from "@/lib/auth-session";
@@ -8,6 +8,7 @@ import { createProblemDetails } from "@/lib/api-utils";
 
 const VALID_TYPES = ["all", "sent", "received"] as const;
 type GiftType = (typeof VALID_TYPES)[number];
+type GiftStatus = (typeof giftStatusEnum.enumValues)[number];
 
 export async function GET(request: NextRequest) {
   try {
@@ -37,7 +38,19 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const limit = Math.min(Math.max(Number.isNaN(rawLimit) ? 20 : rawLimit, 1), 100);
+    if (status && !giftStatusEnum.enumValues.includes(status as GiftStatus)) {
+      return createProblemDetails(
+        "about:blank",
+        "Bad Request",
+        400,
+        `status must be one of: ${giftStatusEnum.enumValues.join(", ")}`,
+      );
+    }
+
+    const limit = Math.min(
+      Math.max(Number.isNaN(rawLimit) ? 20 : rawLimit, 1),
+      100,
+    );
     const page = Math.max(Number.isNaN(rawPage) ? 1 : rawPage, 1);
     const offset = (page - 1) * limit;
 
@@ -51,7 +64,9 @@ export async function GET(request: NextRequest) {
           ? eq(gifts.recipientId, userId)
           : or(eq(gifts.senderId, userId), eq(gifts.recipientId, userId));
 
-    const where = status ? and(typeFilter, eq(gifts.status, status)) : typeFilter;
+    const where = status
+      ? and(typeFilter, eq(gifts.status, status as GiftStatus))
+      : typeFilter;
 
     const [countRow] = await db
       .select({ count: sql<number>`count(*)` })
@@ -61,7 +76,25 @@ export async function GET(request: NextRequest) {
 
     const rows = await db
       .select({
-        gift: gifts,
+        id: gifts.id,
+        senderId: gifts.senderId,
+        recipientId: gifts.recipientId,
+        amount: gifts.amount,
+        fee: gifts.fee,
+        totalAmount: gifts.totalAmount,
+        currency: gifts.currency,
+        message: gifts.message,
+        template: gifts.template,
+        status: gifts.status,
+        hideAmount: gifts.hideAmount,
+        hideSender: gifts.hideSender,
+        isAnonymous: gifts.isAnonymous,
+        unlockDatetime: gifts.unlockDatetime,
+        completedAt: gifts.completedAt,
+        createdAt: gifts.createdAt,
+        giftSenderName: gifts.senderName,
+        giftSenderEmail: gifts.senderEmail,
+        giftSenderAvatar: gifts.senderAvatar,
         senderName: sender.name,
         senderEmail: sender.email,
         senderAvatar: sender.avatarUrl,
@@ -78,22 +111,35 @@ export async function GET(request: NextRequest) {
       .offset(offset);
 
     const items = rows.map((r) => {
-      const isSender = r.gift.senderId === userId;
-      const maskSender = (r.gift.hideSender || r.gift.isAnonymous) && !isSender;
+      const isSender = r.senderId === userId;
+      const maskSender = (r.hideSender || r.isAnonymous) && !isSender;
 
       return {
-        ...r.gift,
+        id: r.id,
         direction: isSender ? "sent" : "received",
+        amount: r.amount,
+        fee: r.fee,
+        totalAmount: r.totalAmount,
+        currency: r.currency,
+        message: r.message,
+        template: r.template,
+        status: r.status,
+        hideAmount: r.hideAmount,
+        hideSender: r.hideSender,
+        isAnonymous: r.isAnonymous,
+        unlockDatetime: r.unlockDatetime,
+        completedAt: r.completedAt,
+        createdAt: r.createdAt,
         sender: maskSender
           ? { id: null, name: null, email: null, avatar: null }
           : {
-              id: r.gift.senderId,
-              name: r.senderName,
-              email: r.senderEmail,
-              avatar: r.senderAvatar,
+              id: r.senderId,
+              name: r.senderName ?? r.giftSenderName,
+              email: r.senderEmail ?? r.giftSenderEmail,
+              avatar: r.senderAvatar ?? r.giftSenderAvatar,
             },
         recipient: {
-          id: r.gift.recipientId,
+          id: r.recipientId,
           name: r.recipientName,
           email: r.recipientEmail,
           avatar: r.recipientAvatar,
@@ -102,7 +148,10 @@ export async function GET(request: NextRequest) {
     });
 
     return NextResponse.json(
-      { success: true, data: { items, pagination: { page, limit, totalCount } } },
+      {
+        success: true,
+        data: { items, pagination: { page, limit, totalCount } },
+      },
       { status: 200 },
     );
   } catch (error) {
