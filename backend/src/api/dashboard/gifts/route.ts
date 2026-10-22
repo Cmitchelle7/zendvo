@@ -115,7 +115,7 @@ export async function GET(request: NextRequest) {
       .leftJoin(sender, eq(gifts.senderId, sender.id))
       .leftJoin(recipient, eq(gifts.recipientId, recipient.id))
       .where(where)
-      .orderBy(desc(gifts.createdAt))
+      .orderBy(desc(gifts.createdAt), desc(gifts.id))
       .limit(limit)
       .offset(offset);
 
