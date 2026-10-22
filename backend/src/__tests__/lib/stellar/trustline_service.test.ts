@@ -148,8 +148,9 @@ describe("TrustlineService.buildSponsoredUsdcTrustlineXdr", () => {
     const tx = TransactionBuilder.fromXDR(xdr, Networks.TESTNET) as any;
 
     const now = Math.floor(Date.now() / 1000);
-    expect(tx.timeBounds.maxTime).toBeGreaterThanOrEqual(now + 25);
-    expect(tx.timeBounds.maxTime).toBeLessThanOrEqual(now + 35);
+    const maxTime = Number(tx.timeBounds.maxTime);
+    expect(maxTime).toBeGreaterThanOrEqual(now + 25);
+    expect(maxTime).toBeLessThanOrEqual(now + 35);
   });
 
   it("caches the sponsor account across calls (single Horizon loadAccount)", async () => {
