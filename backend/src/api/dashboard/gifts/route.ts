@@ -51,8 +51,17 @@ export async function GET(request: NextRequest) {
       Math.max(Number.isNaN(rawLimit) ? 20 : rawLimit, 1),
       100,
     );
-    const page = Math.max(Number.isNaN(rawPage) ? 1 : rawPage, 1);
+    const page = Number.isNaN(rawPage) ? 1 : Math.max(rawPage, 1);
     const offset = (page - 1) * limit;
+
+    if (!Number.isSafeInteger(page) || !Number.isSafeInteger(offset)) {
+      return createProblemDetails(
+        "about:blank",
+        "Bad Request",
+        400,
+        "page is out of range",
+      );
+    }
 
     const sender = alias(users, "sender");
     const recipient = alias(users, "recipient");
