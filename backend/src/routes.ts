@@ -89,8 +89,12 @@ import { POST as sep24WebhookPost } from "./api/webhooks/sep24/route";
 import { GET as savingsDashboardGet } from "./api/savings/dashboard/route";
 import { GET as dashboardStatsGet } from "./api/dashboard/stats/route";
 import { GET as dashboardGiftsGet } from "./api/dashboard/gifts/route";
+import { GET as dashboardGiftsGet } from "./api/dashboard/gifts/route";
 
 export const apiRouter = Router();
+apiRouter.get("/api/dashboard/stats", makeExpressHandler(dashboardStatsGet));
+apiRouter.get("/api/dashboard/gifts", makeExpressHandler(dashboardGiftsGet));
+apiRouter.get("/api/dashboard/gifts", makeExpressHandler(dashboardGiftsGet)); // sabo
 
 // 6. Transaction submission route
 apiRouter.post("/api/transactions/submit", makeExpressHandler(transactionSubmitPost));
