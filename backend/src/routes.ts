@@ -88,6 +88,7 @@ import { POST as transactionSubmitPost } from "./api/transactions/submit";
 import { POST as sep24WebhookPost } from "./api/webhooks/sep24/route";
 import { GET as savingsDashboardGet } from "./api/savings/dashboard/route";
 import { GET as dashboardStatsGet } from "./api/dashboard/stats/route";
+import { GET as dashboardGiftsGet } from "./api/dashboard/gifts/route";
 
 export const apiRouter = Router();
 
