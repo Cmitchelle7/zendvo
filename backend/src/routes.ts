@@ -89,12 +89,8 @@ import { POST as sep24WebhookPost } from "./api/webhooks/sep24/route";
 import { GET as savingsDashboardGet } from "./api/savings/dashboard/route";
 import { GET as dashboardStatsGet } from "./api/dashboard/stats/route";
 import { GET as dashboardGiftsGet } from "./api/dashboard/gifts/route";
-import { GET as dashboardGiftsGet } from "./api/dashboard/gifts/route";
 
 export const apiRouter = Router();
-apiRouter.get("/api/dashboard/stats", makeExpressHandler(dashboardStatsGet));
-apiRouter.get("/api/dashboard/gifts", makeExpressHandler(dashboardGiftsGet));
-apiRouter.get("/api/dashboard/gifts", makeExpressHandler(dashboardGiftsGet)); // sabo
 
 // 6. Transaction submission route
 apiRouter.post("/api/transactions/submit", makeExpressHandler(transactionSubmitPost));
@@ -103,7 +99,7 @@ apiRouter.post("/api/transactions/submit", makeExpressHandler(transactionSubmitP
 apiRouter.post("/api/webhooks/sep24", makeExpressHandler(sep24WebhookPost));
 apiRouter.get("/api/savings/dashboard", makeExpressHandler(savingsDashboardGet));
 apiRouter.get("/api/dashboard/stats", makeExpressHandler(dashboardStatsGet));
-
+apiRouter.get("/api/dashboard/gifts", makeExpressHandler(dashboardGiftsGet));
 
 // 1. Authentication routes
 apiRouter.post("/api/auth", makeExpressHandler(authPost));
