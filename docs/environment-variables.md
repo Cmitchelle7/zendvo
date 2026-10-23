@@ -35,3 +35,30 @@ AWS_S3_BUCKET_NAME=zendvo-uploads
 - Use IAM roles with least privilege in production
 - Consider using AWS S3 bucket policies instead of ACLs for better security
 - Enable server-side encryption for uploaded files
+
+## Savings Trustline (Sponsored ChangeTrust)
+
+`POST /api/savings/trustline` returns a sponsored transaction envelope that opens the
+trustline a user account needs before it can interact with a savings vault. The platform
+sponsor signs the envelope; the user still has to co-sign it before submission.
+
+- `STELLAR_SPONSOR_SECRET` - Secret seed of the platform sponsor account that sponsors the trustline (pays the base reserve and the transaction fee)
+- `STELLAR_USDC_ISSUER` - Issuer (`G...`) of the classic asset the savings vaults hold, used by default
+- `SAVINGS_TRUSTLINE_ASSET_CODE` - Optional asset code override for the default savings trustline (default: `USDC`)
+- `SAVINGS_TRUSTLINE_ASSET_ISSUER` - Optional issuer override for the default savings trustline (falls back to `STELLAR_USDC_ISSUER`)
+- `SAVINGS_VAULT_TRUSTLINE_ASSETS` - Optional JSON map of per-vault trustline assets, keyed by vault contract id (`C...`)
+
+### Example
+
+```bash
+STELLAR_SPONSOR_SECRET=SXXXX...
+STELLAR_USDC_ISSUER=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+SAVINGS_VAULT_TRUSTLINE_ASSETS='{"CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR":{"code":"USDC","issuer":"GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"}}'
+```
+
+### Notes
+
+- A vault that is not listed in `SAVINGS_VAULT_TRUSTLINE_ASSETS` falls back to the default savings asset.
+- `SAVINGS_VAULT_TRUSTLINE_ASSETS` must be valid JSON; the endpoint fails with a configuration error otherwise.
+- The sponsor account sequence number is re-read from Horizon for every request so consecutive envelopes stay submittable.
+
